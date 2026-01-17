@@ -106,6 +106,26 @@ Rules:
 - category/title/prompt/why should be in Chinese.
 """
 
+# --- Time Machine prompts ---
+TM_SYS = """
+你是知识时间线判定引擎。
+给你 current 和 candidates（历史知识），判断关系：
+
+返回严格 JSON：
+{
+  "relation": "new|update|duplicate|related",
+  "parent_id": "uuid or empty",
+  "confidence": 0-1,
+  "reason": "一句话",
+  "delta": {
+    "added": [],
+    "changed": [],
+    "conflicts": []
+  },
+  "merged_summary": "string"
+}
+"""
+
 # --- request/response models for chat ---
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
@@ -124,6 +144,12 @@ class RecommendationRequest(BaseModel):
     head_id: Optional[str] = None
     max_q: int = 6
     persist: bool = True
+
+class TimeMachineRequest(BaseModel):
+    project_id: str = "default"
+    current_record_id: str
+    limit_candidates: int = 30
+    persist_tags: bool = True  # write __tm_* tags back to current record
 
 def _safe_parse_tags_obj(obj: dict) -> dict:
     summary = (obj.get("summary") or "").strip()
@@ -217,6 +243,72 @@ def _get_head_record(db, project_id: str, head_id: Optional[str]) -> Optional[Re
         .order_by(Record.ts.desc())
         .first()
     )
+
+def _tm_tags(tm: dict) -> list:
+    # Encode tm result into tags for timeline backtracking
+    rel = (tm.get("relation") or "").strip()
+    pid = (tm.get("parent_id") or "").strip()
+    out = []
+    if rel in ("update", "duplicate") and pid:
+        out.append({"name": f"__tm_rel:{rel}__", "confidence": 1.0})
+        out.append({"name": f"__tm_parent:{pid}__", "confidence": 1.0})
+    return out
+
+def _run_time_machine_llm(current: dict, candidates: list) -> dict:
+    payload = {"current": current, "candidates": candidates}
+    try:
+        r = llm_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": TM_SYS},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+            stream=False,
+        )
+        raw = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"llm_error: {e}")
+
+    m = re.search(r"\{.*\}", raw, flags=re.S)
+    if not m:
+        return {"relation": "new", "parent_id": "", "confidence": 0.0, "reason": "no_json", "delta": {"added": [], "changed": [], "conflicts": []}, "merged_summary": ""}
+
+    try:
+        obj = json.loads(m.group(0))
+        if not isinstance(obj, dict):
+            raise ValueError("not_dict")
+    except Exception:
+        return {"relation": "new", "parent_id": "", "confidence": 0.0, "reason": "json_parse_error", "delta": {"added": [], "changed": [], "conflicts": []}, "merged_summary": ""}
+
+    # Normalize fields
+    rel = str(obj.get("relation") or "new").strip()
+    if rel not in ("new", "update", "duplicate", "related"):
+        rel = "new"
+    pid = str(obj.get("parent_id") or "").strip()
+    try:
+        conf = float(obj.get("confidence", 0.0) or 0.0)
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    reason = str(obj.get("reason") or "").strip()
+    delta = obj.get("delta") if isinstance(obj.get("delta"), dict) else {"added": [], "changed": [], "conflicts": []}
+    merged = str(obj.get("merged_summary") or "").strip()
+
+    # Ensure delta lists
+    for k in ("added", "changed", "conflicts"):
+        v = delta.get(k)
+        if not isinstance(v, list):
+            delta[k] = []
+
+    return {
+        "relation": rel,
+        "parent_id": pid,
+        "confidence": conf,
+        "reason": reason,
+        "delta": delta,
+        "merged_summary": merged,
+    }
 
 app = FastAPI()
 
@@ -433,3 +525,83 @@ def generate_recommendations(req: RecommendationRequest):
         return {"recommendations": out, "record_id": rec_id}
 
     return {"recommendations": out}
+
+@app.post("/v1/time-machine/resolve")
+def time_machine_resolve(req: TimeMachineRequest):
+    lim = max(5, min(int(req.limit_candidates or 30), 100))
+
+    with SessionLocal() as db:
+        cur = db.get(Record, req.current_record_id)
+        if not cur:
+            raise HTTPException(status_code=404, detail="current_record_not_found")
+        if (cur.project_id or "default") != req.project_id:
+            raise HTTPException(status_code=400, detail="project_id_mismatch")
+
+        # Candidates: same project, exclude current
+        cand_rows = (
+            db.query(Record)
+            .filter(Record.project_id == req.project_id)
+            .filter(Record.id != req.current_record_id)
+            .order_by(Record.ts.desc())
+            .limit(lim)
+            .all()
+        )
+
+        current_obj = {
+            "id": cur.id,
+            "ts": int(cur.ts.timestamp()),
+            "project_id": cur.project_id or "default",
+            "source": cur.source or "unknown",
+            "user_text": cur.user_text,
+            "assistant_text": cur.assistant_text,
+            "summary": cur.summary or "",
+            "tags": cur.tags or [],
+        }
+
+        candidates = []
+        for r in cand_rows:
+            candidates.append({
+                "id": r.id,
+                "ts": int(r.ts.timestamp()),
+                "project_id": r.project_id or "default",
+                "source": r.source or "unknown",
+                "summary": r.summary or "",
+                "tags": r.tags or [],
+                # Keep payload small; summary+tags is usually enough
+            })
+
+    tm = _run_time_machine_llm(current_obj, candidates)
+    tag_patch = _tm_tags(tm)
+
+    updated_record = None
+    if req.persist_tags and tag_patch:
+        with SessionLocal() as db:
+            cur = db.get(Record, req.current_record_id)
+            if not cur:
+                raise HTTPException(status_code=404, detail="current_record_not_found")
+            old_tags = cur.tags or []
+            # Dedup by name
+            existing = set([t.get("name") for t in old_tags if isinstance(t, dict)])
+            for t in tag_patch:
+                if t["name"] not in existing:
+                    old_tags.append(t)
+            cur.tags = old_tags
+            db.add(cur)
+            db.commit()
+
+            updated_record = {
+                "id": cur.id,
+                "project_id": cur.project_id or "default",
+                "source": cur.source or "unknown",
+                "ts": int(cur.ts.timestamp()),
+                "user_text": cur.user_text,
+                "assistant_text": cur.assistant_text,
+                "summary": cur.summary or "",
+                "tags": cur.tags or [],
+            }
+
+    return {
+        "time_machine": tm,
+        "tag_patch": tag_patch,
+        "record": updated_record or current_obj,
+    }
