@@ -79,6 +79,33 @@ TAG_SYS = """
 - 标签用中文名词短语，尽量短
 """
 
+# --- recommendation prompts ---
+RECO_SYS = """
+You are a prompt recommendation engine.
+Return STRICT JSON only (no markdown, no explanation):
+
+{
+  "prompts": [
+    {
+      "category": "string",
+      "title": "string",
+      "prompt": "string",
+      "why": "string"
+    }
+  ],
+  "meta": {
+    "project_id": "string",
+    "head_id": "string",
+    "tag_hint": "string",
+    "summary": "string"
+  }
+}
+
+Rules:
+- prompts: 1 to N items (N <= 6), ordered by usefulness.
+- category/title/prompt/why should be in Chinese.
+"""
+
 # --- request/response models for chat ---
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
@@ -91,6 +118,12 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     record: dict  # keep flexible for now
+
+class RecommendationRequest(BaseModel):
+    project_id: str = "default"
+    head_id: Optional[str] = None
+    max_q: int = 6
+    persist: bool = True
 
 def _safe_parse_tags_obj(obj: dict) -> dict:
     summary = (obj.get("summary") or "").strip()
@@ -149,6 +182,41 @@ def run_chat(user_text: str, history: Optional[List[ChatMessage]] = None) -> str
         return (r.choices[0].message.content or "").strip()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"llm_error: {e}")
+
+def _extract_json_obj(text: str) -> dict:
+    m = re.search(r"\{.*\}", text or "", flags=re.S)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+def _tag_hint_from_tags(tags: list) -> str:
+    names = []
+    for t in tags or []:
+        if isinstance(t, dict) and t.get("name"):
+            names.append(str(t["name"]).strip())
+        if len(names) >= 4:
+            break
+    return "、".join([n for n in names if n]) or "当前主题"
+
+def _get_head_record(db, project_id: str, head_id: Optional[str]) -> Optional[Record]:
+    if head_id:
+        r = db.get(Record, head_id)
+        if r and (r.project_id or "default") == project_id:
+            return r
+        return None
+
+    # Default: latest chat record for this project
+    return (
+        db.query(Record)
+        .filter(Record.project_id == project_id)
+        .filter(Record.source == "chat")
+        .order_by(Record.ts.desc())
+        .first()
+    )
 
 app = FastAPI()
 
@@ -275,3 +343,93 @@ def v1_chat(req: ChatRequest):
         "tags": meta.get("tags", []),
     }
     return {"record": record_out}
+
+@app.post("/v1/recommendations/generate")
+def generate_recommendations(req: RecommendationRequest):
+    max_q = max(1, min(int(req.max_q or 6), 6))
+
+    with SessionLocal() as db:
+        head = _get_head_record(db, req.project_id, req.head_id)
+        if not head:
+            raise HTTPException(status_code=404, detail="head_record_not_found")
+
+        tag_hint = _tag_hint_from_tags(head.tags or [])
+        context = {
+            "project_id": req.project_id,
+            "head_id": head.id,
+            "summary": head.summary or "",
+            "tags": head.tags or [],
+            "user_text": head.user_text,
+            "assistant_text": head.assistant_text,
+            "tag_hint": tag_hint,
+            "max_q": max_q,
+        }
+
+    # LLM call (non-stream)
+    try:
+        r = llm_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {"role": "system", "content": RECO_SYS},
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+            ],
+            temperature=0.3,
+            stream=False,
+        )
+        raw = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"llm_error: {e}")
+
+    obj = _extract_json_obj(raw)
+    prompts = obj.get("prompts") if isinstance(obj.get("prompts"), list) else []
+    prompts = prompts[:max_q]
+
+    # Normalize output
+    clean_prompts = []
+    for p in prompts:
+        if not isinstance(p, dict):
+            continue
+        clean_prompts.append({
+            "category": str(p.get("category", "") or ""),
+            "title": str(p.get("title", "") or ""),
+            "prompt": str(p.get("prompt", "") or ""),
+            "why": str(p.get("why", "") or ""),
+        })
+
+    out = {
+        "prompts": clean_prompts,
+        "meta": {
+            "project_id": req.project_id,
+            "head_id": req.head_id or "",
+            "tag_hint": obj.get("meta", {}).get("tag_hint", "") if isinstance(obj.get("meta"), dict) else "",
+            "summary": obj.get("meta", {}).get("summary", "") if isinstance(obj.get("meta"), dict) else "",
+        }
+    }
+
+    # Persist as a record if requested
+    if req.persist:
+        rec_id = str(uuid.uuid4())
+        ts = int(time.time())
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        with SessionLocal() as db:
+            head = _get_head_record(db, req.project_id, req.head_id)
+            base_tags = (head.tags or []) if head else []
+            tags_for_rec = list(base_tags) + [{"name": "__kind:recommendation__", "confidence": 1.0}]
+
+            row = Record(
+                id=rec_id,
+                project_id=req.project_id,
+                source="recommendation",
+                ts=dt,
+                user_text="",
+                assistant_text=json.dumps(out, ensure_ascii=False),
+                summary="prompt recommendations",
+                tags=tags_for_rec,
+            )
+            db.add(row)
+            db.commit()
+
+        return {"recommendations": out, "record_id": rec_id}
+
+    return {"recommendations": out}
