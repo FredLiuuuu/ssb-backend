@@ -86,6 +86,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     user_text: str = Field(min_length=1)
+    project_id: str = "default"
     history: Optional[List[ChatMessage]] = None  # optional
 
 class ChatResponse(BaseModel):
@@ -231,7 +232,7 @@ def v1_chat(req: ChatRequest):
         with SessionLocal() as db:
             row = Record(
                 id=rec_id,
-                project_id="default",
+                project_id=req.project_id,
                 source="chat",
                 ts=dt,
                 user_text=req.user_text,
@@ -247,6 +248,8 @@ def v1_chat(req: ChatRequest):
     record_out = {
         "id": rec_id,
         "ts": ts,
+        "project_id": req.project_id,
+        "source": "chat",
         "user_text": req.user_text,
         "assistant_text": assistant_text,
         "summary": meta.get("summary", ""),
