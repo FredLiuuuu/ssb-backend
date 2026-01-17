@@ -310,6 +310,109 @@ def _run_time_machine_llm(current: dict, candidates: list) -> dict:
         "merged_summary": merged,
     }
 
+# --- Timeline build helpers ---
+
+def _extract_tm_from_tags(tags: list) -> tuple[Optional[str], Optional[str]]:
+    rel, pid = None, None
+    for t in tags or []:
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("name") or "").strip()
+        if name.startswith("__tm_rel:") and name.endswith("__"):
+            rel = name[len("__tm_rel:"):-2]
+        elif name.startswith("__tm_parent:") and name.endswith("__"):
+            pid = name[len("__tm_parent:"):-2]
+    return rel, pid
+
+def _build_timeline_from_rows(head_id: str, rows: list, limit_chain: int = 200) -> dict:
+    # Build nodes map
+    nodes: dict[str, dict] = {}
+    parent_of: dict[str, str] = {}
+    edge_meta: dict[str, dict] = {}
+
+    for r in rows:
+        rid = r.id
+        nodes[rid] = {
+            "id": rid,
+            "project_id": r.project_id or "default",
+            "source": r.source or "unknown",
+            "ts": int(r.ts.timestamp()),
+            "user_text": r.user_text,
+            "assistant_text": r.assistant_text,
+            "summary": r.summary or "",
+            "tags": r.tags or [],
+        }
+
+    # Parent pointers from __tm_* tags
+    for rid, node in nodes.items():
+        rel, pid = _extract_tm_from_tags(node.get("tags", []))
+        if rel in ("update", "duplicate") and pid and pid in nodes:
+            parent_of[rid] = pid
+            edge_meta[rid] = {
+                "type": rel,
+                "confidence": 1.0,
+                "reason": "from __tm_* tags",
+                "delta": {"added": [], "changed": [], "conflicts": []},
+            }
+
+    if head_id not in nodes:
+        raise HTTPException(status_code=404, detail="head_id_not_found_in_project")
+
+    # Backtrack chain: head -> parent -> ...
+    chain: list[str] = []
+    cur = head_id
+    seen = set()
+    while cur and cur in nodes and cur not in seen and len(chain) < limit_chain:
+        seen.add(cur)
+        chain.append(cur)
+        cur = parent_of.get(cur)
+
+    root_id = chain[-1] if chain else head_id
+
+    # Timeline output: root -> head
+    ordered = list(reversed(chain))
+
+    timeline = {
+        "timeline_id": str(uuid.uuid4()),
+        "project_id": nodes[head_id]["project_id"],
+        "root_id": root_id,
+        "head_id": head_id,
+        "title": (nodes[head_id]["summary"][:24] if nodes[head_id]["summary"] else "timeline"),
+        "nodes": [],
+        "edges": [],
+        "events": [],
+    }
+
+    total = len(ordered)
+    for idx, rid in enumerate(ordered, start=1):
+        n = dict(nodes[rid])
+        n["version_index"] = idx
+        n["version_count"] = total
+        timeline["nodes"].append(n)
+
+    for child in chain:
+        parent = parent_of.get(child)
+        if parent:
+            meta = edge_meta.get(child, {})
+            timeline["edges"].append({
+                "from": child,
+                "to": parent,
+                "type": meta.get("type", "update"),
+                "confidence": meta.get("confidence", 1.0),
+                "delta": meta.get("delta", {"added": [], "changed": [], "conflicts": []}),
+                "reason": meta.get("reason", ""),
+            })
+
+    for n in timeline["nodes"]:
+        timeline["events"].append({
+            "ts": n.get("ts"),
+            "type": "created" if n["id"] == root_id else "updated",
+            "node_id": n["id"],
+            "message": "created" if n["id"] == root_id else "updated",
+        })
+
+    return timeline
+
 app = FastAPI()
 
 @app.on_event("startup")
@@ -605,3 +708,16 @@ def time_machine_resolve(req: TimeMachineRequest):
         "tag_patch": tag_patch,
         "record": updated_record or current_obj,
     }
+
+@app.get("/v1/timeline")
+def get_timeline(project_id: str, head_id: str, limit: int = 400):
+    limit = max(10, min(int(limit or 400), 2000))
+    with SessionLocal() as db:
+        rows = (
+            db.query(Record)
+            .filter(Record.project_id == project_id)
+            .order_by(Record.ts.desc())
+            .limit(limit)
+            .all()
+        )
+    return _build_timeline_from_rows(head_id=head_id, rows=rows)
