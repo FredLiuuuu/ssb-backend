@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from sqlalchemy import (
-    create_engine, Column, String, Text, DateTime, JSON, func
+    create_engine, Column, String, Text, DateTime, JSON, func, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -162,10 +162,9 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    # DB ping
     try:
         with engine.connect() as conn:
-            conn.execute(func.now().select())  # lightweight
+            conn.execute(text("SELECT 1"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"db_error: {e}")
     return {"ok": True}
@@ -200,10 +199,29 @@ def ingest(rec: RecordIn):
     return {"id": rec.id}
 
 @app.get("/v1/records")
-def list_records(limit: int = 20):
+def list_records(
+    limit: int = 20,
+    project_id: Optional[str] = None,
+    source: Optional[str] = None,
+    before_ts: Optional[int] = None,  # unix seconds, for pagination
+):
     limit = max(1, min(limit, 100))
+
     with SessionLocal() as db:
-        rows = db.query(Record).order_by(Record.ts.desc()).limit(limit).all()
+        q = db.query(Record)
+
+        if project_id:
+            q = q.filter(Record.project_id == project_id)
+
+        if source:
+            q = q.filter(Record.source == source)
+
+        if before_ts:
+            dt = datetime.fromtimestamp(before_ts, tz=timezone.utc)
+            q = q.filter(Record.ts < dt)
+
+        rows = q.order_by(Record.ts.desc()).limit(limit).all()
+
         items = []
         for r in rows:
             items.append({
@@ -216,6 +234,7 @@ def list_records(limit: int = 20):
                 "summary": r.summary or "",
                 "tags": r.tags or [],
             })
+
     return {"items": items}
 
 # --- endpoint: POST /v1/chat ---
